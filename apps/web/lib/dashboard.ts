@@ -1,4 +1,3 @@
-import pointsData from "@/data/points.json";
 import {
   CITY_OPTIONS,
   getHeatLevelLabel,
@@ -13,25 +12,22 @@ import type {
   HeatLevel,
   IssueType,
   Priority,
+  PointFeature,
   ShadeLevel,
 } from "@shadowmap/types";
+import { DAY_MS, shiftDayKey, toAppDayKey } from "./dates";
 
-export type DashboardOrigin = "collected" | "all";
 export type DashboardPeriod = 7 | 30 | "all";
 
 export interface DashboardParams {
-  origin: DashboardOrigin;
   city: City | "all";
   days: DashboardPeriod;
-  includePending?: boolean;
 }
 
 export interface DashboardTotals {
   approved: number;
   highCritical: number;
   neighborhoods: number;
-  aiAssistedPercent: number;
-  pending: number | null;
 }
 
 export interface NeighborhoodRank {
@@ -66,9 +62,8 @@ export interface RecentPoint {
 }
 
 export interface DashboardData {
-  params: Omit<DashboardParams, "includePending">;
+  params: DashboardParams;
   totals: DashboardTotals;
-  collectedCount: number;
   ranking: NeighborhoodRank[];
   distributions: {
     issueType: DistributionRow[];
@@ -86,39 +81,6 @@ const PRIORITY_WEIGHTS: Record<Priority, number> = {
   low: 1,
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-interface SimulatedPointRecord {
-  id: string;
-  city: City;
-  neighborhood: string;
-  issueType: IssueType;
-  heatLevel: HeatLevel;
-  shadeLevel: ShadeLevel;
-  priority: Priority;
-  dataOrigin: "simulated";
-  aiAssisted: boolean;
-  createdAt: Date;
-}
-
-// O painel usa exatamente os mesmos dados simulados do mapa, sem banco.
-const SIMULATED_POINTS: SimulatedPointRecord[] = (
-  pointsData as Array<{
-    id: string;
-    city: City;
-    neighborhood: string;
-    issueType: IssueType;
-    heatLevel: HeatLevel;
-    shadeLevel: ShadeLevel;
-    priority: Priority;
-  }>
-).map((point, index) => ({
-  ...point,
-  dataOrigin: "simulated",
-  aiAssisted: index % 3 === 0,
-  createdAt: new Date(Date.now() - index * 2 * DAY_MS),
-}));
-
 function normalizeText(value: string): string {
   return value
     .normalize("NFD")
@@ -128,18 +90,10 @@ function normalizeText(value: string): string {
     .trim();
 }
 
-function toDayKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
-
 export function parseDashboardParams(values: {
-  origin?: string | null;
   city?: string | null;
   days?: string | null;
 }): DashboardParams {
-  const origin: DashboardOrigin =
-    values.origin === "collected" ? "collected" : "all";
-
   const city = CITY_OPTIONS.includes(values.city as City)
     ? (values.city as City)
     : "all";
@@ -147,7 +101,7 @@ export function parseDashboardParams(values: {
   const days: DashboardPeriod =
     values.days === "7" ? 7 : values.days === "30" ? 30 : "all";
 
-  return { origin, city, days };
+  return { city, days };
 }
 
 function mostFrequentSpelling(spellings: Map<string, number>): string {
@@ -157,26 +111,36 @@ function mostFrequentSpelling(spellings: Map<string, number>): string {
   })[0][0];
 }
 
-export async function getDashboardData(
+export function getDashboardData(
   input: DashboardParams,
-): Promise<DashboardData> {
-  const { origin, city, days, includePending = false } = input;
+  sessionPoints: readonly PointFeature[],
+  now = new Date(),
+): DashboardData {
+  const { city, days } = input;
+  const points = sessionPoints
+    .filter(
+      (point) =>
+        point.dataOrigin === "simulated" &&
+        (city === "all" || point.city === city),
+    )
+    .map((point) => ({
+      ...point,
+      createdAt: new Date(point.submittedAt ?? now.toISOString()),
+    }))
+    .filter(
+      (point) =>
+        Number.isFinite(point.createdAt.getTime()) && point.createdAt <= now,
+    )
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 
-  const points = SIMULATED_POINTS.filter(
-    (point) =>
-      origin === "all" && (city === "all" || point.city === city),
-  ).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-
-  const collectedCount = 0;
-
-  const pending = includePending ? 0 : null;
-
-  const cutoff =
-    days === "all" ? null : new Date(Date.now() - days * DAY_MS);
-
-  const filteredPoints = cutoff
-    ? points.filter((point) => point.createdAt >= cutoff)
-    : points;
+  const today = toAppDayKey(now);
+  const dailyStart =
+    days === "all"
+      ? toAppDayKey(points.at(-1)?.createdAt ?? now)
+      : shiftDayKey(today, -(days - 1));
+  const filteredPoints = points.filter(
+    (point) => toAppDayKey(point.createdAt) >= dailyStart,
+  );
 
   const groups = new Map<
     string,
@@ -233,10 +197,6 @@ export async function getDashboardData(
   const highCritical = filteredPoints.filter(
     (point) => point.priority === "critical" || point.priority === "high",
   ).length;
-  const aiAssistedCount = filteredPoints.filter(
-    (point) => point.aiAssisted,
-  ).length;
-
   const distribution = <T extends string>(
     options: T[],
     values: T[],
@@ -249,37 +209,26 @@ export async function getDashboardData(
     }));
 
   const dailyMap = new Map<string, number>();
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-  const dailyStart = new Date(today.getTime() - 29 * DAY_MS);
-
-  for (const point of points) {
-    if (point.createdAt < dailyStart) continue;
-
-    const key = toDayKey(point.createdAt);
+  for (const point of filteredPoints) {
+    const key = toAppDayKey(point.createdAt);
     dailyMap.set(key, (dailyMap.get(key) ?? 0) + 1);
   }
 
-  const daily: DailyRow[] = Array.from({ length: 30 }, (_, index) => {
-    const date = new Date(dailyStart.getTime() + index * DAY_MS);
-    const key = toDayKey(date);
+  const dayCount =
+    Math.round((Date.parse(today) - Date.parse(dailyStart)) / DAY_MS) + 1;
+  const daily: DailyRow[] = Array.from({ length: dayCount }, (_, index) => {
+    const key = shiftDayKey(dailyStart, index);
 
     return { date: key, count: dailyMap.get(key) ?? 0 };
   });
 
   return {
-    params: { origin, city, days },
+    params: { city, days },
     totals: {
       approved: filteredPoints.length,
       highCritical,
       neighborhoods: groups.size,
-      aiAssistedPercent:
-        filteredPoints.length > 0
-          ? Math.round((aiAssistedCount / filteredPoints.length) * 100)
-          : 0,
-      pending,
     },
-    collectedCount,
     ranking,
     distributions: {
       issueType: distribution(
